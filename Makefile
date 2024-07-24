@@ -1,5 +1,8 @@
 drepo ?= natsio
 
+PACKAGE_NAME = arryved-nats-exporter
+VERSION      = 0.15.1
+
 prometheus-nats-exporter.docker:
 	CGO_ENABLED=0 GOOS=linux go build -o $@ -v -a \
 		-tags netgo -tags timetzdata \
@@ -12,6 +15,14 @@ dockerx:
 .PHONY: build
 build:
 	go build
+
+build-linux:
+	GOOS=linux GOARCH=amd64 go build
+
+.PHONY:
+package: build-linux
+	mkdir -p build
+	nfpm pkg --packager deb --target build/
 
 .PHONY: test
 test:
@@ -34,3 +45,7 @@ lint:
 	fi
 	go vet ./...
 	$(shell go env GOPATH)/bin/golangci-lint run ./...
+
+.PHONY: deploy
+deploy: package
+	gcloud artifacts apt upload arryved-apt --location=us-central1 --project=arryved-tools --source=build/$(PACKAGE_NAME)_$(VERSION)_amd64.deb

@@ -1,0 +1,38 @@
+# nfpm configuration file for building package
+#
+# check https://nfpm.goreleaser.com/configuration for detailed usage
+#
+# nfpm needed in build env: `brew install nfpm` for local dev
+#
+name: "arryved-nats-exporter"
+arch: "amd64"
+platform: "linux"
+
+# TODO - source version from env and/or generate programmatically
+version: "0.15.1"
+section: "default"
+priority: "extra"
+replaces: []
+
+provides:
+  - prometheus-nats-exporter
+depends:
+  - apt
+recommends: []
+suggests: []
+conflicts: []
+
+maintainer: "Arryved SRE <sre-team@arryved.com>"
+description: This is a prometheus exporter for varz and healthz.
+vendor: "Arryved"
+homepage: "https://docs.arryved.com/topics/sre-rlzavcux"
+license: "none/proprietary"
+
+contents:
+  # Note: no systemd hooks are added, since there may be multiple instances of the daemon running; configure these in Ansible
+  - src: ./prometheus-nats-exporter
+    dst: /usr/local/bin/prometheus-nats-exporter
+    file_info:
+      mode: 0755
+      owner: root
+      group: root

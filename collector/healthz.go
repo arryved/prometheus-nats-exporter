@@ -69,7 +69,7 @@ func (nc *healthzCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, server := range nc.servers {
 		var health Healthz
 		if err := getMetricURL(nc.httpClient, server.URL, &health); err != nil {
-			Debugf("ignoring server %s: %v", server.ID, err)
+			Debugf("healthz collector ignoring server %s: %v", server.ID, err)
 			continue
 		}
 

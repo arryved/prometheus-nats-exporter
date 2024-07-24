@@ -19,6 +19,9 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
+	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +75,12 @@ func newPrometheusGaugeVec(system, subsystem, name, help, prefix string) (metric
 	if prefix != "" {
 		namespace = prefix
 	}
+
+	namespace = convertIllegalMetricName(namespace)
+	subsystem = convertIllegalMetricName(subsystem)
+	name = convertIllegalMetricName(name)
+	help = convertIllegalMetricName(help)
+
 	opts := prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: subsystem,
@@ -94,6 +103,11 @@ func newLabelGauge(system, subsystem, name, help, prefix, label string) *prometh
 	if prefix != "" {
 		namespace = prefix
 	}
+
+	system = convertIllegalMetricName(system)
+	subsystem = convertIllegalMetricName(subsystem)
+	name = convertIllegalMetricName(name)
+
 	opts := prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: subsystem,
@@ -109,8 +123,16 @@ func newLabelGauge(system, subsystem, name, help, prefix, label string) *prometh
 // GetMetricURL retrieves a NATS Metrics JSON.
 // This can be called against any monitoring URL for NATS.
 // On any this function will error, warn and return nil.
-func getMetricURL(httpClient *http.Client, url string, response interface{}) error {
-	resp, err := httpClient.Get(url)
+func getMetricURL(httpClient *http.Client, urlRaw string, response interface{}) error {
+	// normalize the url; arryved NATS can't handle extra slashes
+	providedUrl, err := url.Parse(urlRaw)
+	if err != nil {
+		return err
+	}
+	providedUrl.Path = path.Clean(providedUrl.Path)
+	normalizedUrl := providedUrl.String()
+
+	resp, err := httpClient.Get(normalizedUrl)
 	if err != nil {
 		return err
 	}
@@ -212,7 +234,7 @@ func (nc *NATSCollector) makeRequests() map[string]map[string]interface{} {
 	for _, u := range nc.servers {
 		var response = map[string]interface{}{}
 		if err := getMetricURL(nc.httpClient, u.URL, &response); err != nil {
-			Debugf("ignoring server %s: %v", u.ID, err)
+			Debugf("nats collector ignoring server %s: %v", u.ID, err)
 			delete(resps, u.ID)
 		}
 
@@ -337,6 +359,7 @@ func fqName(name string, prefix ...string) (string, []string) {
 }
 
 func (nc *NATSCollector) objectToMetrics(response map[string]interface{}, namespace string, prefix ...string) {
+	// TODO BW - make skip patterns configurable
 	skipFQN := map[string]struct{}{
 		"leaf":                    {},
 		"trusted_operators_claim": {},
@@ -360,11 +383,39 @@ func (nc *NATSCollector) objectToMetrics(response map[string]interface{}, namesp
 		"config_load_time": {},
 	}
 
+	skipPatterns := []string{
+		`device\.syserror`,
+	}
+
+	skipMatchers := []*regexp.Regexp{}
+	
+	for pattern := range skipPatterns {
+		matcher, err := regexp.Compile(skipPatterns[pattern])
+		if err != nil {
+			Debugf("warning - pattern '%s' does not compile", pattern)
+		} else {
+			skipMatchers = append(skipMatchers, matcher)
+		}
+	}
+
 	for k := range response {
 		fqn, path := fqName(k, prefix...)
 		if _, ok := skipFQN[fqn]; ok {
 			continue
 		}
+
+		skip := false
+		for matcher := range skipMatchers {
+			if skipMatchers[matcher].MatchString(fqn) {
+				skip = true
+				Debugf("skipping fqn=%s since it matches a skip pattern", fqn)
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
 		// if it's not already defined in metricDefinitions
 		if _, ok := nc.Stats[fqn]; ok {
 			continue
@@ -467,6 +518,16 @@ func boolToFloat(b bool) float64 {
 		return 1.0
 	}
 	return 0.0
+}
+
+func convertIllegalMetricName(name string) string {
+	var result string = name
+
+	// replace anything that's not in the legal regex char classes
+	noIllegalChars := regexp.MustCompile(`[^a-zA-Z0-9_]`)
+	result = noIllegalChars.ReplaceAllString(result, "_")
+
+	return result
 }
 
 // NewCollector creates a new NATS Collector from a list of monitoring URLs.

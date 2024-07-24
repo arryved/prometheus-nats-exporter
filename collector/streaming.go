@@ -187,7 +187,7 @@ func (nc *serverzCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, server := range nc.servers {
 		var resp StreamingServerz
 		if err := getMetricURL(nc.httpClient, server.URL, &resp); err != nil {
-			Debugf("ignoring server %s: %v", server.ID, err)
+			Debugf("serverz collector ignoring server %s: %v", server.ID, err)
 			continue
 		}
 

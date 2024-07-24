@@ -280,7 +280,7 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 			suffix = "/jsz"
 		}
 		if err := getMetricURL(nc.httpClient, server.URL+suffix, &resp); err != nil {
-			Debugf("ignoring server %s: %v", server.ID, err)
+			Debugf("jsz collector ignoring server %s: %v", server.ID, err)
 			continue
 		}
 		var varz nats.Varz

@@ -2,6 +2,10 @@
 
 # The Prometheus NATS Exporter
 
+Note: This is an offline Arryved fork of the official project; hopefully we can
+get our changes merged to the upstream at some point but the priority is to get
+it working.
+
 The Prometheus NATS Exporter consists of both a package and an application that
 exports [NATS server](http://nats.io/documentation/server/gnatsd-intro) metrics
 to [Prometheus](https://prometheus.io/) for monitoring.  The exporter aggregates
@@ -10,7 +14,7 @@ routez, healthz) from a NATS server into a single Prometheus exporter endpoint.
 
 # Build
 ``` bash
-make build
+make build-linux
 ```
 
 If you want to run tests, you can do this.
@@ -30,12 +34,6 @@ port of `5555`.
 
 ``` bash
 prometheus-nats-exporter -varz "http://localhost:5555"
-```
-
-To run with docker, you can use the following image:
-
-```sh
-docker run natsio/prometheus-nats-exporter:latest
 ```
 
 ## Usage
