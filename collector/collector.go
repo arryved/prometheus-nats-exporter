@@ -99,12 +99,12 @@ func newLabelGauge(system, subsystem, name, help, prefix, label string) *prometh
 	if help == "" {
 		help = name
 	}
+	system = convertIllegalMetricName(system)
 	namespace := system
 	if prefix != "" {
 		namespace = prefix
 	}
 
-	system = convertIllegalMetricName(system)
 	subsystem = convertIllegalMetricName(subsystem)
 	name = convertIllegalMetricName(name)
 
