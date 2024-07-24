@@ -27,6 +27,7 @@ _testmain.go
 *.prof
 travis_wait*.log
 
+build/
 dist/
 prometheus-nats-exporter
 coverage.txt
