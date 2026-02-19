@@ -39,12 +39,21 @@ type jszCollector struct {
 	maxMemory  *prometheus.Desc
 	maxStorage *prometheus.Desc
 
+	// Account stats
+	maxAccountMemory  *prometheus.Desc
+	maxAccountStorage *prometheus.Desc
+	accountStorage    *prometheus.Desc
+	accountMemory     *prometheus.Desc
+
 	// Stream stats
 	streamMessages      *prometheus.Desc
 	streamBytes         *prometheus.Desc
 	streamFirstSeq      *prometheus.Desc
 	streamLastSeq       *prometheus.Desc
 	streamConsumerCount *prometheus.Desc
+	streamSubjectCount  *prometheus.Desc
+	streamLimitBytes    *prometheus.Desc
+	streamLimitMessages *prometheus.Desc
 
 	// Consumer stats
 	consumerDeliveredConsumerSeq *prometheus.Desc
@@ -55,29 +64,66 @@ type jszCollector struct {
 	consumerNumPending           *prometheus.Desc
 	consumerAckFloorStreamSeq    *prometheus.Desc
 	consumerAckFloorConsumerSeq  *prometheus.Desc
+
+	// Stream source stats
+	streamSourceLag    *prometheus.Desc
+	streamSourceActive *prometheus.Desc
+
+	// Stream mirror stats
+	streamMirrorLag    *prometheus.Desc
+	streamMirrorActive *prometheus.Desc
+
+	// metadata keys to extract
+	streamMetaKeys   []string
+	consumerMetaKeys []string
 }
 
 func isJszEndpoint(system string) bool {
 	return system == JetStreamSystem
 }
 
-func newJszCollector(system, endpoint string, servers []*CollectedServer) prometheus.Collector {
+func newJszCollector(
+	system, endpoint string,
+	servers []*CollectedServer,
+	streamMetaKeys, consumerMetaKeys []string,
+) prometheus.Collector {
 	serverLabels := []string{"server_id", "server_name", "cluster", "domain", "meta_leader", "is_meta_leader"}
 
-	var streamLabels []string
-	streamLabels = append(streamLabels, serverLabels...)
+	streamLabels := append([]string{}, serverLabels...)
 	streamLabels = append(streamLabels, "account")
+	streamLabels = append(streamLabels, "account_name")
 	streamLabels = append(streamLabels, "account_id")
 	streamLabels = append(streamLabels, "stream_name")
 	streamLabels = append(streamLabels, "stream_leader")
 	streamLabels = append(streamLabels, "is_stream_leader")
+	streamLabels = append(streamLabels, "stream_raft_group")
+	for _, k := range streamMetaKeys {
+		streamLabels = append(streamLabels, "stream_meta_"+k)
+	}
 
-	var consumerLabels []string
-	consumerLabels = append(consumerLabels, streamLabels...)
+	accountLabels := append([]string{}, serverLabels...)
+	accountLabels = append(accountLabels, "account")
+	accountLabels = append(accountLabels, "account_name")
+	accountLabels = append(accountLabels, "account_id")
+
+	consumerLabels := append([]string{}, streamLabels...)
 	consumerLabels = append(consumerLabels, "consumer_name")
 	consumerLabels = append(consumerLabels, "consumer_leader")
 	consumerLabels = append(consumerLabels, "is_consumer_leader")
 	consumerLabels = append(consumerLabels, "consumer_desc")
+	for _, k := range consumerMetaKeys {
+		consumerLabels = append(consumerLabels, "consumer_meta_"+k)
+	}
+
+	sourceLabels := append([]string{}, streamLabels...)
+	sourceLabels = append(sourceLabels, "source_name")
+	sourceLabels = append(sourceLabels, "source_api")
+	sourceLabels = append(sourceLabels, "source_deliver")
+
+	mirrorLabels := append([]string{}, streamLabels...)
+	mirrorLabels = append(mirrorLabels, "mirror_name")
+	mirrorLabels = append(mirrorLabels, "mirror_api")
+	mirrorLabels = append(mirrorLabels, "mirror_deliver")
 
 	nc := &jszCollector{
 		httpClient: &http.Client{
@@ -133,6 +179,34 @@ func newJszCollector(system, endpoint string, servers []*CollectedServer) promet
 			serverLabels,
 			nil,
 		),
+		// jetstream_account_max_memory
+		maxAccountMemory: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "account", "max_memory"),
+			"JetStream Account Max Memory in bytes",
+			accountLabels,
+			nil,
+		),
+		// jetstream_account_max_storage
+		maxAccountStorage: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "account", "max_storage"),
+			"JetStream Account Max Storage in bytes",
+			accountLabels,
+			nil,
+		),
+		// jetstream_account_storage_used
+		accountStorage: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "account", "storage_used"),
+			"Total number of bytes used by JetStream storage",
+			accountLabels,
+			nil,
+		),
+		// jetstream_account_memory_used
+		accountMemory: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "account", "memory_used"),
+			"Total number of bytes used by JetStream memory",
+			accountLabels,
+			nil,
+		),
 		// jetstream_stream_total_messages
 		streamMessages: prometheus.NewDesc(
 			prometheus.BuildFQName(system, "stream", "total_messages"),
@@ -140,10 +214,25 @@ func newJszCollector(system, endpoint string, servers []*CollectedServer) promet
 			streamLabels,
 			nil,
 		),
+		// jetstream_stream_limit_messages
+		streamLimitMessages: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "limit_messages"),
+			"The maximum number of messages allowed in a JetStream stream as per its configuration. "+
+				"A value of -1 indicates no limit.",
+			streamLabels,
+			nil,
+		),
 		// jetstream_stream_total_bytes
 		streamBytes: prometheus.NewDesc(
 			prometheus.BuildFQName(system, "stream", "total_bytes"),
 			"Total stored bytes from a stream",
+			streamLabels,
+			nil,
+		),
+		// jetstream_stream_limit_bytes
+		streamLimitBytes: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "limit_bytes"),
+			"The maximum configured storage limit (in bytes) for a JetStream stream. A value of -1 indicates no limit.",
 			streamLabels,
 			nil,
 		),
@@ -165,6 +254,13 @@ func newJszCollector(system, endpoint string, servers []*CollectedServer) promet
 		streamConsumerCount: prometheus.NewDesc(
 			prometheus.BuildFQName(system, "stream", "consumer_count"),
 			"Total number of consumers from a stream",
+			streamLabels,
+			nil,
+		),
+		// jetstream_stream_subjects
+		streamSubjectCount: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "subject_count"),
+			"Total number of subjects in a stream",
 			streamLabels,
 			nil,
 		),
@@ -222,6 +318,36 @@ func newJszCollector(system, endpoint string, servers []*CollectedServer) promet
 			consumerLabels,
 			nil,
 		),
+		// jetstream_stream_source_lag
+		streamSourceLag: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "source_lag"),
+			"Number of messages a stream source is behind",
+			sourceLabels,
+			nil,
+		),
+		// jetstream_stream_source_active_duration_ns
+		streamSourceActive: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "source_active_duration_ns"),
+			"Stream source active duration in nanoseconds (-1 indicates inactive)",
+			sourceLabels,
+			nil,
+		),
+		// jetstream_stream_mirror_lag
+		streamMirrorLag: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "mirror_lag"),
+			"Number of messages a stream mirror is behind",
+			mirrorLabels,
+			nil,
+		),
+		// jetstream_stream_mirror_active_duration_ns
+		streamMirrorActive: prometheus.NewDesc(
+			prometheus.BuildFQName(system, "stream", "mirror_active_duration_ns"),
+			"Stream mirror active duration in nanoseconds (-1 indicates inactive)",
+			mirrorLabels,
+			nil,
+		),
+		streamMetaKeys:   streamMetaKeys,
+		consumerMetaKeys: consumerMetaKeys,
 	}
 
 	// Use the endpoint
@@ -253,6 +379,9 @@ func (nc *jszCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- nc.streamFirstSeq
 	ch <- nc.streamLastSeq
 	ch <- nc.streamConsumerCount
+	ch <- nc.streamSubjectCount
+	ch <- nc.streamLimitBytes
+	ch <- nc.streamLimitMessages
 
 	// Consumer state
 	ch <- nc.consumerDeliveredConsumerSeq
@@ -261,6 +390,14 @@ func (nc *jszCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- nc.consumerNumRedelivered
 	ch <- nc.consumerNumWaiting
 	ch <- nc.consumerNumPending
+
+	// Source state
+	ch <- nc.streamSourceLag
+	ch <- nc.streamSourceActive
+
+	// Mirror state
+	ch <- nc.streamMirrorLag
+	ch <- nc.streamMirrorActive
 }
 
 // Collect gathers the server jsz metrics.
@@ -273,7 +410,7 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 		case "account", "accounts":
 			suffix = "/jsz?accounts=true"
 		case "consumer", "consumers", "all":
-			suffix = "/jsz?consumers=true&config=true"
+			suffix = "/jsz?consumers=true&config=true&raft=true"
 		case "stream", "streams":
 			suffix = "/jsz?streams=true"
 		default:
@@ -289,7 +426,7 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 		var serverID, serverName, clusterName, jsDomain, clusterLeader string
-		var streamName, streamLeader string
+		var streamName, streamLeader, streamRaftGroup string
 		var consumerName, consumerDesc, consumerLeader string
 		var isMetaLeader, isStreamLeader, isConsumerLeader string
 		var accountName string
@@ -330,8 +467,23 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 		for _, account := range resp.AccountDetails {
 			accountName = account.Name
 			accountID = account.Id
+
+			accountMetric := func(key *prometheus.Desc, value float64) prometheus.Metric {
+				return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value,
+					// Server Labels
+					serverID, serverName, clusterName, jsDomain, clusterLeader, isMetaLeader,
+					// Account Labels
+					accountName, accountName, accountID)
+			}
+
+			ch <- accountMetric(nc.maxAccountStorage, float64(account.ReservedStore))
+			ch <- accountMetric(nc.maxAccountMemory, float64(account.ReservedMemory))
+			ch <- accountMetric(nc.accountStorage, float64(account.Store))
+			ch <- accountMetric(nc.accountMemory, float64(account.Memory))
+
 			for _, stream := range account.Streams {
 				streamName = stream.Name
+
 				if stream.Cluster != nil {
 					streamLeader = stream.Cluster.Leader
 					if streamLeader == serverName {
@@ -342,18 +494,80 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 				} else {
 					isStreamLeader = "true"
 				}
+				streamRaftGroup = stream.RaftGroup
+
+				streamLabelValues := []string{
+					// Server Labels
+					serverID, serverName, clusterName, jsDomain, clusterLeader, isMetaLeader,
+					// Stream Labels
+					accountName, accountName, accountID, streamName, streamLeader, isStreamLeader, streamRaftGroup,
+				}
+				for _, k := range nc.streamMetaKeys {
+					var v string
+					if stream.Config != nil {
+						v = stream.Config.Metadata[k]
+					}
+					streamLabelValues = append(streamLabelValues, v)
+				}
 				streamMetric := func(key *prometheus.Desc, value float64) prometheus.Metric {
-					return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value,
-						// Server Labels
-						serverID, serverName, clusterName, jsDomain, clusterLeader, isMetaLeader,
-						// Stream Labels
-						accountName, accountID, streamName, streamLeader, isStreamLeader)
+					return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value, streamLabelValues...)
 				}
 				ch <- streamMetric(nc.streamMessages, float64(stream.State.Msgs))
 				ch <- streamMetric(nc.streamBytes, float64(stream.State.Bytes))
 				ch <- streamMetric(nc.streamFirstSeq, float64(stream.State.FirstSeq))
 				ch <- streamMetric(nc.streamLastSeq, float64(stream.State.LastSeq))
 				ch <- streamMetric(nc.streamConsumerCount, float64(stream.State.Consumers))
+				ch <- streamMetric(nc.streamSubjectCount, float64(stream.State.NumSubjects))
+
+				if stream.Config != nil {
+					ch <- streamMetric(nc.streamLimitBytes, float64(stream.Config.MaxBytes))
+					ch <- streamMetric(nc.streamLimitMessages, float64(stream.Config.MaxMsgs))
+				}
+
+				// Now with the sources.
+				for _, source := range stream.Sources {
+					sourceName := source.Name
+					var sourceAPI, sourceDeliver string
+					if source.External != nil {
+						sourceAPI = source.External.ApiPrefix
+						sourceDeliver = source.External.DeliverPrefix
+					}
+					sourceMetric := func(key *prometheus.Desc, value float64) prometheus.Metric {
+						return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value,
+							// Server Labels
+							serverID, serverName, clusterName, jsDomain, clusterLeader, isMetaLeader,
+							// Stream Labels
+							accountName, accountName, accountID, streamName, streamLeader, isStreamLeader, streamRaftGroup,
+							// Source Labels
+							sourceName, sourceAPI, sourceDeliver,
+						)
+					}
+					ch <- sourceMetric(nc.streamSourceLag, float64(source.Lag))
+					ch <- sourceMetric(nc.streamSourceActive, float64(source.Active))
+				}
+
+				// Now with the mirror. There can be only one.
+				if stream.Mirror != nil {
+					mirror := stream.Mirror
+					mirrorName := mirror.Name
+					var mirrorAPI, mirrorDeliver string
+					if mirror.External != nil {
+						mirrorAPI = mirror.External.ApiPrefix
+						mirrorDeliver = mirror.External.DeliverPrefix
+					}
+					mirrorMetric := func(key *prometheus.Desc, value float64) prometheus.Metric {
+						return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value,
+							// Server Labels
+							serverID, serverName, clusterName, jsDomain, clusterLeader, isMetaLeader,
+							// Stream Labels
+							accountName, accountName, accountID, streamName, streamLeader, isStreamLeader, streamRaftGroup,
+							// Mirror Labels
+							mirrorName, mirrorAPI, mirrorDeliver,
+						)
+					}
+					ch <- mirrorMetric(nc.streamMirrorLag, float64(mirror.Lag))
+					ch <- mirrorMetric(nc.streamMirrorActive, float64(mirror.Active))
+				}
 
 				// Now with the consumers.
 				for _, consumer := range stream.Consumer {
@@ -371,15 +585,24 @@ func (nc *jszCollector) Collect(ch chan<- prometheus.Metric) {
 					} else {
 						isConsumerLeader = "true"
 					}
+
+					// (same labels as stream)
+					consumerLabelValues := append([]string{}, streamLabelValues...)
+
+					consumerLabelValues = append(
+						consumerLabelValues,
+						// Consumer Labels
+						consumerName, consumerLeader, isConsumerLeader, consumerDesc,
+					)
+					for _, k := range nc.consumerMetaKeys {
+						var v string
+						if consumer.Config != nil {
+							v = consumer.Config.Metadata[k]
+						}
+						consumerLabelValues = append(consumerLabelValues, v)
+					}
 					consumerMetric := func(key *prometheus.Desc, value float64) prometheus.Metric {
-						return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value,
-							// Server Labels
-							serverID, serverName, clusterName, jsDomain, clusterLeader, isMetaLeader,
-							// Stream Labels
-							accountName, accountID, streamName, streamLeader, isStreamLeader,
-							// Consumer Labels
-							consumerName, consumerLeader, isConsumerLeader, consumerDesc,
-						)
+						return prometheus.MustNewConstMetric(key, prometheus.GaugeValue, value, consumerLabelValues...)
 					}
 					ch <- consumerMetric(nc.consumerDeliveredConsumerSeq, float64(consumer.Delivered.Consumer))
 					ch <- consumerMetric(nc.consumerDeliveredStreamSeq, float64(consumer.Delivered.Stream))

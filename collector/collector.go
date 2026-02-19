@@ -34,10 +34,8 @@ var (
 	// use gnatsd for backward compatibility. Changing would require users to
 	// change their dashboards or other applications that rely on the
 	// prometheus metric names.
-	CoreSystem       = "gnatsd"
-	StreamingSystem  = "nss"
-	ReplicatorSystem = "replicator"
-	JetStreamSystem  = "jetstream"
+	CoreSystem      = "gnatsd"
+	JetStreamSystem = "jetstream"
 )
 
 // CollectedServer is a NATS server polled by this collector
@@ -533,9 +531,6 @@ func convertIllegalMetricName(name string) string {
 // NewCollector creates a new NATS Collector from a list of monitoring URLs.
 // Each URL should be to a specific endpoint (e.g. varz, connz, healthz, subsz, or routez)
 func NewCollector(system, endpoint, prefix string, servers []*CollectedServer) prometheus.Collector {
-	if isStreamingEndpoint(system, endpoint) {
-		return newStreamingCollector(getSystem(system, prefix), endpoint, servers)
-	}
 	if isHealthzEndpoint(system, endpoint) {
 		return newHealthzCollector(getSystem(system, prefix), endpoint, servers)
 	}
@@ -548,14 +543,23 @@ func NewCollector(system, endpoint, prefix string, servers []*CollectedServer) p
 	if isAccstatzEndpoint(system, endpoint) {
 		return newAccstatzCollector(getSystem(system, prefix), endpoint, servers)
 	}
+	if isAccountzEndpoint(system, endpoint) {
+		return newAccountzCollector(getSystem(system, prefix), endpoint, servers)
+	}
 	if isLeafzEndpoint(system, endpoint) {
 		return newLeafzCollector(getSystem(system, prefix), endpoint, servers)
 	}
-	if isReplicatorEndpoint(system, endpoint) {
-		return newReplicatorCollector(getSystem(system, prefix), servers)
-	}
 	if isJszEndpoint(system) {
-		return newJszCollector(getSystem(system, prefix), endpoint, servers)
+		return newJszCollector(getSystem(system, prefix), endpoint, servers, []string{}, []string{})
 	}
 	return newNatsCollector(getSystem(system, prefix), endpoint, servers)
+}
+
+// NewJszCollector creates a new NATS JetStream Collector.
+func NewJszCollector(
+	endpoint, prefix string,
+	servers []*CollectedServer,
+	streamMetaKeys, consumerMetaKeys []string,
+) prometheus.Collector {
+	return newJszCollector(getSystem(JetStreamSystem, prefix), endpoint, servers, streamMetaKeys, consumerMetaKeys)
 }

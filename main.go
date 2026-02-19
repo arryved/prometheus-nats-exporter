@@ -77,8 +77,9 @@ func updateOptions(debugAndTrace, useSysLog bool, opts *exporter.NATSExporterOpt
 	}
 
 	metricsSpecified := opts.GetConnz || opts.GetVarz || opts.GetSubz || opts.GetHealthz ||
-		opts.GetRoutez || opts.GetGatewayz || opts.GetAccstatz || opts.GetLeafz || opts.GetStreamingChannelz ||
-		opts.GetStreamingServerz || opts.GetReplicatorVarz || opts.GetJszFilter == ""
+		opts.GetHealthzJsEnabledOnly || opts.GetHealthzJsServerOnly ||
+		opts.GetRoutez || opts.GetGatewayz || opts.GetAccstatz || opts.GetAccountz || opts.GetLeafz ||
+		opts.GetJszFilter == ""
 	if !metricsSpecified {
 		// No logger setup yet, so use fmt
 		fmt.Printf("No metrics specified.  Defaulting to varz.\n")
@@ -120,16 +121,22 @@ func main() {
 	flag.BoolVar(&opts.GetConnzDetailed, "connz_detailed", false,
 		"Get detailed connection metrics for each client. Enables flag `connz` implicitly.")
 	flag.BoolVar(&opts.GetHealthz, "healthz", false, "Get health metrics.")
-	flag.BoolVar(&opts.GetReplicatorVarz, "replicatorVarz", false, "Get replicator general metrics.")
+	flag.BoolVar(&opts.GetHealthzJsEnabledOnly, "healthz_js_enabled_only", false,
+		"Get health metrics with js-enabled-only=true.")
+	flag.BoolVar(&opts.GetHealthzJsServerOnly, "healthz_js_server_only", false,
+		"Get health metrics with js-server-only=true.")
 	flag.BoolVar(&opts.GetGatewayz, "gatewayz", false, "Get gateway metrics.")
 	flag.BoolVar(&opts.GetAccstatz, "accstatz", false, "Get accstatz metrics.")
+	flag.BoolVar(&opts.GetAccountz, "accountz", false, "Get account details metrics.")
 	flag.BoolVar(&opts.GetLeafz, "leafz", false, "Get leaf metrics.")
 	flag.BoolVar(&opts.GetRoutez, "routez", false, "Get route metrics.")
 	flag.BoolVar(&opts.GetSubz, "subz", false, "Get subscription metrics.")
-	flag.BoolVar(&opts.GetStreamingChannelz, "channelz", false, "Get streaming channel metrics.")
-	flag.BoolVar(&opts.GetStreamingServerz, "serverz", false, "Get streaming server metrics.")
 	flag.BoolVar(&opts.GetVarz, "varz", false, "Get general metrics.")
 	flag.StringVar(&opts.GetJszFilter, "jsz", "", "Select JetStream metrics to filter (e.g streams, accounts, consumers)")
+	flag.StringVar(&opts.JszSteamMetaKeys, "jsz_stream_meta_keys", "",
+		"Select JetStream stream metadata to output (comma separated)")
+	flag.StringVar(&opts.JszConsumerMetaKeys, "jsz_consumer_meta_keys", "",
+		"Select JetStream consumer metadata to output (comma separated)")
 	flag.StringVar(&opts.CertFile, "tlscert", "", "Server certificate file (Enables HTTPS).")
 	flag.StringVar(&opts.KeyFile, "tlskey", "", "Private key for server certificate (used with HTTPS).")
 	flag.StringVar(&opts.CaFile, "tlscacert", "", "Client certificate CA for verification (used with HTTPS).")

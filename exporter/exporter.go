@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,33 +45,35 @@ const (
 // NATSExporterOptions are options to configure the NATS collector
 type NATSExporterOptions struct {
 	collector.LoggerOptions
-	ListenAddress        string
-	ListenPort           int
-	ScrapePath           string
-	GetHealthz           bool
-	GetConnz             bool
-	GetConnzDetailed     bool
-	GetVarz              bool
-	GetSubz              bool
-	GetRoutez            bool
-	GetGatewayz          bool
-	GetAccstatz          bool
-	GetLeafz             bool
-	GetReplicatorVarz    bool
-	GetStreamingChannelz bool
-	GetStreamingServerz  bool
-	GetJszFilter         string
-	RetryInterval        time.Duration
-	CertFile             string
-	KeyFile              string
-	CaFile               string
-	NATSServerURL        string
-	NATSServerTag        string
-	HTTPUser             string // User in metrics scrape by prometheus.
-	HTTPPassword         string
-	Prefix               string
-	UseInternalServerID  bool
-	UseServerName        bool
+	ListenAddress           string
+	ListenPort              int
+	ScrapePath              string
+	GetHealthz              bool
+	GetHealthzJsEnabledOnly bool
+	GetHealthzJsServerOnly  bool
+	GetConnz                bool
+	GetConnzDetailed        bool
+	GetVarz                 bool
+	GetSubz                 bool
+	GetRoutez               bool
+	GetGatewayz             bool
+	GetAccstatz             bool
+	GetAccountz             bool
+	GetLeafz                bool
+	GetJszFilter            string
+	JszSteamMetaKeys        string
+	JszConsumerMetaKeys     string
+	RetryInterval           time.Duration
+	CertFile                string
+	KeyFile                 string
+	CaFile                  string
+	NATSServerURL           string
+	NATSServerTag           string
+	HTTPUser                string // User in metrics scrape by prometheus.
+	HTTPPassword            string
+	Prefix                  string
+	UseInternalServerID     bool
+	UseServerName           bool
 }
 
 // NATSExporter collects NATS metrics
@@ -135,6 +138,15 @@ func (ne *NATSExporter) createCollector(system, endpoint string) {
 			ne.servers))
 }
 
+func (ne *NATSExporter) createJszCollector(endpoint string, streamMetaKeys, consumerMetaKeys []string) {
+	ne.registerCollector(collector.JetStreamSystem, endpoint,
+		collector.NewJszCollector(endpoint,
+			ne.opts.Prefix,
+			ne.servers,
+			streamMetaKeys,
+			consumerMetaKeys))
+}
+
 func (ne *NATSExporter) registerCollector(system, endpoint string, nc prometheus.Collector) {
 	if err := ne.registry.Register(nc); err != nil {
 		if _, ok := err.(prometheus.AlreadyRegisteredError); ok {
@@ -181,9 +193,6 @@ func (ne *NATSExporter) InitializeCollectors() error {
 		return fmt.Errorf("no servers configured to obtain metrics")
 	}
 
-	if opts.GetReplicatorVarz && opts.GetVarz {
-		return fmt.Errorf("replicatorVarz cannot be used with varz")
-	}
 	if opts.GetSubz {
 		ne.createCollector(collector.CoreSystem, "subsz")
 	}
@@ -192,6 +201,12 @@ func (ne *NATSExporter) InitializeCollectors() error {
 	}
 	if opts.GetHealthz {
 		ne.createCollector(collector.CoreSystem, "healthz")
+	}
+	if opts.GetHealthzJsEnabledOnly {
+		ne.createCollector(collector.CoreSystem, "healthz_js_enabled_only")
+	}
+	if opts.GetHealthzJsServerOnly {
+		ne.createCollector(collector.CoreSystem, "healthz_js_server_only")
 	}
 	if opts.GetConnzDetailed {
 		ne.createCollector(collector.CoreSystem, "connz_detailed")
@@ -204,20 +219,14 @@ func (ne *NATSExporter) InitializeCollectors() error {
 	if opts.GetAccstatz {
 		ne.createCollector(collector.CoreSystem, "accstatz")
 	}
+	if opts.GetAccountz {
+		ne.createCollector(collector.CoreSystem, "accountz")
+	}
 	if opts.GetLeafz {
 		ne.createCollector(collector.CoreSystem, "leafz")
 	}
 	if opts.GetRoutez {
 		ne.createCollector(collector.CoreSystem, "routez")
-	}
-	if opts.GetStreamingChannelz {
-		ne.createCollector(collector.StreamingSystem, "channelsz")
-	}
-	if opts.GetStreamingServerz {
-		ne.createCollector(collector.StreamingSystem, "serverz")
-	}
-	if opts.GetReplicatorVarz {
-		ne.createCollector(collector.ReplicatorSystem, "varz")
 	}
 	if opts.GetJszFilter != "" {
 		switch strings.ToLower(opts.GetJszFilter) {
@@ -225,7 +234,20 @@ func (ne *NATSExporter) InitializeCollectors() error {
 		default:
 			return fmt.Errorf("invalid jsz filter %q", opts.GetJszFilter)
 		}
-		ne.createCollector(collector.JetStreamSystem, opts.GetJszFilter)
+		keyRegex := regexp.MustCompile("[a-zA-Z0-9_]+")
+		streamMetaKeys := strings.Split(opts.JszSteamMetaKeys, ",")
+		for _, k := range streamMetaKeys {
+			if !keyRegex.MatchString(k) {
+				return fmt.Errorf("invalid jsz stream meta key: '%s'", k)
+			}
+		}
+		consumerMetaKeys := strings.Split(opts.JszConsumerMetaKeys, ",")
+		for _, k := range consumerMetaKeys {
+			if !keyRegex.MatchString(k) {
+				return fmt.Errorf("invalid jsz consumer meta key: '%s'", k)
+			}
+		}
+		ne.createJszCollector(opts.GetJszFilter, streamMetaKeys, consumerMetaKeys)
 	}
 	if len(ne.Collectors) == 0 {
 		return fmt.Errorf("no Collectors specified")
