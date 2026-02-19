@@ -1,7 +1,7 @@
 drepo ?= natsio
 
 PACKAGE_NAME = arryved-nats-exporter
-VERSION      = 0.15.1
+VERSION      = 0.19.0
 
 prometheus-nats-exporter.docker:
 	CGO_ENABLED=0 GOOS=linux go build -o $@ -v -a \

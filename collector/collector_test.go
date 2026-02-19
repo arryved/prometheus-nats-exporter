@@ -16,13 +16,14 @@ package collector
 import (
 	"fmt"
 	"maps"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	pet "github.com/nats-io/prometheus-nats-exporter/test"
-	stan "github.com/nats-io/stan.go"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -41,43 +42,22 @@ func verifyCollector(system, url string, endpoint string, cases map[string]float
 		URL: url,
 	}
 	coll := NewCollector(system, endpoint, "", servers)
-
-	// now collect the metrics
-	c := make(chan prometheus.Metric)
-	go coll.Collect(c)
-	for {
-		select {
-		case metric := <-c:
-			pb := &dto.Metric{}
-			if err := metric.Write(pb); err != nil {
-				t.Fatalf("Unable to write metric: %v", err)
-			}
-			gauge := pb.GetGauge()
-			val := gauge.GetValue()
-
-			name := parseDesc(metric.Desc().String())
-			expected, ok := cases[name]
-			if ok {
-				if val != expected {
-					t.Fatalf("Expected %s=%v, got %v", name, expected, val)
-				}
-			}
-		case <-time.After(10 * time.Millisecond):
-			return
-		}
-	}
+	verifySpecificCollector(cases, coll, t)
 }
 
-func verifyStreamingCollector(url string, endpoint string, cases map[string]float64, t *testing.T) {
+func verifyJszCollector(url string, endpoint string, cases map[string]float64, t *testing.T) {
 	// create a new collector.
 	servers := make([]*CollectedServer, 1)
 	servers[0] = &CollectedServer{
 		ID:  "id",
 		URL: url,
 	}
-	coll := NewCollector(StreamingSystem, endpoint, "", servers)
+	coll := NewJszCollector(endpoint, "", servers, []string{}, []string{})
 
-	// now collect the metrics
+	verifySpecificCollector(cases, coll, t)
+}
+
+func verifySpecificCollector(cases map[string]float64, coll prometheus.Collector, t *testing.T) {
 	c := make(chan prometheus.Metric)
 	go coll.Collect(c)
 	for {
@@ -106,6 +86,34 @@ func verifyStreamingCollector(url string, endpoint string, cases map[string]floa
 // To account for the metrics that share the same descriptor but differ in their variable label values,
 // return a list of lists of label pairs for each of the supplied metric names.
 func getLabelValues(system, url, endpoint string, metricNames []string) (map[string][]map[string]string, error) {
+	servers := make([]*CollectedServer, 1)
+	servers[0] = &CollectedServer{
+		ID:  "id",
+		URL: url,
+	}
+	coll := NewCollector(system, endpoint, "", servers)
+	return getLabelValuesFromCollector(metricNames, coll)
+}
+
+// To account for the metrics that share the same descriptor but differ in their variable label values,
+// return a list of lists of label pairs for each of the supplied metric names.
+func getJszLabelValues(
+	url, endpoint string,
+	streamMetaKeys, consumerMetaKeys, metricNames []string,
+) (map[string][]map[string]string, error) {
+	servers := make([]*CollectedServer, 1)
+	servers[0] = &CollectedServer{
+		ID:  "id",
+		URL: url,
+	}
+	coll := NewJszCollector(endpoint, "", servers, streamMetaKeys, consumerMetaKeys)
+	return getLabelValuesFromCollector(metricNames, coll)
+}
+
+func getLabelValuesFromCollector(
+	metricNames []string,
+	coll prometheus.Collector,
+) (map[string][]map[string]string, error) {
 	labelValues := make(map[string][]map[string]string)
 	namesMap := make(map[string]bool)
 	for _, metricName := range metricNames {
@@ -147,13 +155,7 @@ func getLabelValues(system, url, endpoint string, metricNames []string) (map[str
 		}
 	}()
 
-	// create a new collector and collect
-	servers := make([]*CollectedServer, 1)
-	servers[0] = &CollectedServer{
-		ID:  "id",
-		URL: url,
-	}
-	coll := NewCollector(system, endpoint, "", servers)
+	// collect metrics
 	coll.Collect(metrics)
 	close(metrics)
 
@@ -163,6 +165,52 @@ func getLabelValues(system, url, endpoint string, metricNames []string) (map[str
 		return nil, err
 	case <-done:
 		return labelValues, nil
+	}
+}
+
+func verifyLabels(system, url, endpoint string, expectedLabels map[string]map[string]string, t *testing.T) {
+	metricNames := make([]string, 0, len(expectedLabels))
+	for metricName := range expectedLabels {
+		metricNames = append(metricNames, metricName)
+	}
+
+	labelValues, err := getLabelValues(system, url, endpoint, metricNames)
+
+	if err != nil {
+		t.Fatalf("Failed to get label values: %v", err)
+	}
+
+	for metricName, expectedLabelSet := range expectedLabels {
+		actualLabelSets, ok := labelValues[metricName]
+		if !ok {
+			t.Fatalf("Metric %s not found in collected metrics", metricName)
+		}
+
+		if len(actualLabelSets) == 0 {
+			t.Fatalf("No label sets found for metric %s", metricName)
+		}
+
+		// Check if any of the actual label sets contains the expected labels
+		found := false
+		for _, actualLabelSet := range actualLabelSets {
+			matches := true
+			for expectedKey, expectedValue := range expectedLabelSet {
+				if actualValue, ok := actualLabelSet[expectedKey]; !ok || actualValue != expectedValue {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			t.Fatalf(
+				"Expected labels %v not found in any label set for metric %s. Actual label sets: %v",
+				expectedLabelSet, metricName, actualLabelSets)
+		}
 	}
 }
 
@@ -178,7 +226,7 @@ func TestServerIDFromVarz(t *testing.T) {
 }
 
 func TestServerNameFromVarz(t *testing.T) {
-	serverName := "My Awesome Server Name"
+	serverName := "nats-server"
 	s := pet.RunServerWithName(serverName)
 	defer s.Shutdown()
 
@@ -208,7 +256,7 @@ func TestVarz(t *testing.T) {
 		"gnatsd_varz_out_msgs":          1,
 		"gnatsd_varz_in_bytes":          5,
 		"gnatsd_varz_out_bytes":         5,
-		"gnatsd_varz_subscriptions":     55,
+		"gnatsd_varz_subscriptions":     61,
 	}
 
 	verifyCollector(CoreSystem, url, "varz", cases, t)
@@ -266,6 +314,31 @@ func TestConnz(t *testing.T) {
 	defer nc.Close()
 
 	verifyCollector(CoreSystem, url, "connz", cases, t)
+}
+
+func TestHealthz(t *testing.T) {
+	s := pet.RunServer()
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://localhost:%d", pet.MonitorPort)
+	// see if we get the same stats as the original monitor testing code.
+	// just for our monitoring_port
+
+	cases := map[string]float64{
+		"gnatsd_healthz_status":       0,
+		"gnatsd_healthz_status_value": 1,
+	}
+
+	verifyCollector(CoreSystem, url, "healthz", cases, t)
+
+	// test after server shutdown
+	s.Shutdown()
+
+	cases = map[string]float64{
+		"gnatsd_healthz_status_value": 0,
+	}
+
+	verifyCollector(CoreSystem, url, "healthz", cases, t)
 }
 
 func TestNoServer(t *testing.T) {
@@ -351,7 +424,7 @@ func TestAllEndpoints(t *testing.T) {
 	verifyCollector(CoreSystem, url, "routez", cases, t)
 
 	cases = map[string]float64{
-		"gnatsd_subsz_num_subscriptions": 55,
+		"gnatsd_subsz_num_subscriptions": 61,
 	}
 	verifyCollector(CoreSystem, url, "subsz", cases, t)
 
@@ -364,299 +437,105 @@ func TestAllEndpoints(t *testing.T) {
 		"gnatsd_healthz_status": 0,
 	}
 	verifyCollector(CoreSystem, url, "healthz", cases, t)
-}
-
-const (
-	stanClusterName = "test-cluster"
-	stanClientName  = "sample"
-)
-
-func TestStreamingVarz(t *testing.T) {
-	s := pet.RunStreamingServer()
-	defer s.Shutdown()
-
-	url := fmt.Sprintf("http://localhost:%d/", pet.MonitorPort)
-
-	sc, err := stan.Connect(stanClusterName, stanClientName,
-		stan.NatsURL(fmt.Sprintf("nats://localhost:%d", pet.ClientPort)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sc.Close()
-	sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {})
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-	defer sub.Unsubscribe()
-	totalMsgs := 10
-	msg := []byte("hello")
-	for i := 0; i < totalMsgs; i++ {
-		if err := sc.Publish("foo", msg); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
-	}
-
-	cases := map[string]float64{
-		"gnatsd_varz_total_connections": 5,
-		"gnatsd_varz_connections":       5,
-		"gnatsd_varz_in_msgs":           45,
-		"gnatsd_varz_out_msgs":          44,
-		"gnatsd_varz_in_bytes":          1594,
-		"gnatsd_varz_out_bytes":         1549,
-		"gnatsd_varz_subscriptions":     68,
-	}
-
-	verifyCollector(CoreSystem, url, "varz", cases, t)
-}
-
-func TestStreamingMetrics(t *testing.T) {
-	s := pet.RunStreamingServer()
-	defer s.Shutdown()
-
-	url := fmt.Sprintf("http://localhost:%d/", pet.MonitorPort)
-
-	sc, err := stan.Connect(stanClusterName, stanClientName,
-		stan.NatsURL(fmt.Sprintf("nats://localhost:%d", pet.ClientPort)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sc.Close()
-
-	_, err = sc.Subscribe("foo", func(_ *stan.Msg) {})
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-
-	totalMsgs := 10
-	msg := []byte("hello")
-	for i := 0; i < totalMsgs; i++ {
-		if err := sc.Publish("foo", msg); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
-	}
-
-	cases := map[string]float64{
-		"test_chan_bytes_total":        240,
-		"test_chan_msgs_total":         10,
-		"test_chan_last_seq":           10,
-		"test_chan_subs_last_sent":     10,
-		"test_chan_subs_pending_count": 0,
-		"test_chan_subs_max_inflight":  1024,
-	}
-
-	verifyCollector(StreamingSystem, url, "channelsz", cases, t)
 
 	cases = map[string]float64{
-		"test_server_bytes_total":   0,
-		"test_server_bytes_in":      0,
-		"test_server_bytes_out":     0,
-		"test_server_msgs_total":    0,
-		"test_chan_msgs_in":         0,
-		"test_chan_msgs_out":        0,
-		"test_server_channels":      0,
-		"test_server_subscriptions": 0,
-		"test_server_clients":       0,
-		"test_server_info":          1,
-		"test_server_active":        0,
+		"gnatsd_accountz_expired":       0,
+		"gnatsd_accountz_limit_exports": 0,
 	}
+	verifyCollector(CoreSystem, url, "accountz", cases, t)
 
-	verifyCollector(StreamingSystem, url, "serverz", cases, t)
 }
 
-func TestStreamingMetricsCustomPrefix(t *testing.T) {
-	s := pet.RunStreamingServer()
-	defer s.Shutdown()
+func TestLeafzMetricLabels(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	s := pet.RunLeafzStaticServer(&wg)
+	defer s.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", pet.MonitorPort)
+	url := fmt.Sprintf("http://localhost:%d", pet.StaticPort)
 
-	sc, err := stan.Connect(stanClusterName, stanClientName,
-		stan.NatsURL(fmt.Sprintf("nats://localhost:%d", pet.ClientPort)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sc.Close()
-
-	_, err = sc.Subscribe("foo", func(_ *stan.Msg) {})
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-
-	totalMsgs := 10
-	msg := []byte("hello")
-	for i := 0; i < totalMsgs; i++ {
-		if err := sc.Publish("foo", msg); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
+	// Test first expected label set
+	expectedLabels1 := map[string]map[string]string{
+		"gnatsd_leafz_conn_out_msgs": {
+			"name":      "leafz_server",
+			"account":   "$G",
+			"ip":        "127.0.0.1",
+			"port":      "6223",
+			"server_id": "id",
+		},
 	}
 
-	cases := map[string]float64{
-		"nss_chan_bytes_total":        240,
-		"nss_chan_msgs_total":         10,
-		"nss_chan_last_seq":           10,
-		"nss_chan_subs_last_sent":     10,
-		"nss_chan_subs_pending_count": 0,
-		"nss_chan_subs_max_inflight":  1024,
+	// Test second expected label set
+	expectedLabels2 := map[string]map[string]string{
+		"gnatsd_leafz_conn_out_msgs": {
+			"name":      "",
+			"account":   "$G",
+			"ip":        "127.0.0.2",
+			"port":      "6224",
+			"server_id": "id",
+		},
 	}
 
-	verifyStreamingCollector(url, "channelsz", cases, t)
-
-	cases = map[string]float64{
-		"nss_server_bytes_total":   0,
-		"nss_server_bytes_in":      0,
-		"nss_server_bytes_out":     0,
-		"nss_server_msgs_total":    0,
-		"nss_chan_msgs_in":         0,
-		"nss_chan_msgs_out":        0,
-		"nss_server_channels":      0,
-		"nss_server_subscriptions": 0,
-		"nss_server_clients":       0,
-		"nss_server_info":          1,
-		"nss_server_active":        0,
-	}
-
-	verifyStreamingCollector(url, "serverz", cases, t)
+	verifyLabels(CoreSystem, url, "leafz", expectedLabels1, t)
+	verifyLabels(CoreSystem, url, "leafz", expectedLabels2, t)
 }
 
-func TestStreamingServerInfoMetricLabels(t *testing.T) {
-	s := pet.RunStreamingServer()
+func TestAccountzMetricLabels(t *testing.T) {
+	s := pet.RunServer()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", pet.MonitorPort)
+	url := fmt.Sprintf("http://localhost:%d", pet.MonitorPort)
 
-	serverInfoMetric := "nss_server_info"
-	labelValues, err := getLabelValues(StreamingSystem, url, "serverz", []string{serverInfoMetric})
-	if err != nil {
-		t.Fatalf("Unexpected error getting labels for nss_server_info metric: %v", err)
+	// Test first expected label set
+	expectedLabels1 := map[string]map[string]string{
+		"gnatsd_accountz_client_connections": {
+			"account_id":   "$G",
+			"account_name": "$G",
+			"server_id":    "id",
+		},
 	}
 
-	labelMaps, found := labelValues[serverInfoMetric]
-	if !found || len(labelMaps) != 1 {
-		t.Fatalf("No info found for metric: %v", serverInfoMetric)
-	}
-	labelMap := labelMaps[0]
-
-	expectedLabelNames := []string{"cluster_id", "server_id", "version", "go_version", "state", "role", "start_time"}
-	expectedLabelsNotFound := make([]string, 0)
-	for _, labelName := range expectedLabelNames {
-		if _, found := labelMap[labelName]; !found {
-			expectedLabelsNotFound = append(expectedLabelsNotFound, labelName)
-		}
+	expectedLabels2 := map[string]map[string]string{
+		"gnatsd_accountz_client_connections": {
+			"account_id":   "$SYS",
+			"account_name": "$SYS",
+			"server_id":    "id",
+		},
 	}
 
-	if len(expectedLabelsNotFound) > 0 {
-		t.Fatalf("The following expected labels were missing: %v", expectedLabelsNotFound)
-	}
-}
-
-func TestStreamingSubscriptionsMetricLabels(t *testing.T) {
-	s := pet.RunStreamingServer()
-	defer s.Shutdown()
-
-	queueName := "some-queue-name"
-	durableSubscriptionName := "some-durable-name"
-	durableGroupSubscriptionName := "some-group-durable-name"
-
-	sc, err := stan.Connect(stanClusterName, stanClientName,
-		stan.NatsURL(fmt.Sprintf("nats://localhost:%d", pet.ClientPort)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		err = sc.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	subscriptions := make([]stan.Subscription, 0)
-
-	subscription, err := sc.Subscribe("foo", func(_ *stan.Msg) {})
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	} else {
-		subscriptions = append(subscriptions, subscription)
-	}
-	subscription, err = sc.QueueSubscribe("bar", queueName, func(_ *stan.Msg) {},
-		stan.DurableName(durableGroupSubscriptionName))
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	} else {
-		subscriptions = append(subscriptions, subscription)
-	}
-	subscription, err = sc.Subscribe("baz", func(_ *stan.Msg) {},
-		stan.DurableName(durableSubscriptionName))
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	} else {
-		subscriptions = append(subscriptions, subscription)
-	}
-	defer func() {
-		for _, subscription := range subscriptions {
-			err = subscription.Unsubscribe()
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}()
-
-	url := fmt.Sprintf("http://localhost:%d/", pet.MonitorPort)
-
-	streamingSunscriptionMetrics := []string{"nss_chan_subs_last_sent",
-		"nss_chan_subs_pending_count", "nss_chan_subs_max_inflight"}
-	labelValues, err := getLabelValues(StreamingSystem, url, "channelsz", streamingSunscriptionMetrics)
-	if err != nil {
-		t.Fatalf("Unexpected error getting labels for nss_server_info metric: %v", err)
+	expectedLabels3 := map[string]map[string]string{
+		"gnatsd_accountz_limit_exports": {
+			"account_id":   "$SYS",
+			"account_name": "$SYS",
+			"server_id":    "id",
+		},
 	}
 
-	for _, streamingSunscriptionMetric := range streamingSunscriptionMetrics {
-		labelMaps, found := labelValues[streamingSunscriptionMetric]
-		if !found || len(labelMaps) != len(subscriptions) {
-			t.Fatalf("No sufficient info found for metric: %v", streamingSunscriptionMetric)
-		}
-
-		foundQueuedDurableLabels, foundDurableLabels := false, false
-		expectedLabelNames := []string{"server_id", "server_role", "channel", "client_id", "inbox",
-			"queue_name", "is_durable", "is_offline", "durable_name"}
-		for subscriptionIndex := range subscriptions {
-			expectedLabelsNotFound := make([]string, 0)
-			for _, labelName := range expectedLabelNames {
-				if _, found := labelMaps[subscriptionIndex][labelName]; !found {
-					expectedLabelsNotFound = append(expectedLabelsNotFound, labelName)
-				}
-			}
-
-			if len(expectedLabelsNotFound) > 0 {
-				t.Fatalf("Streaming subscription metric %v for channel %v was missing the following expected labels %v",
-					streamingSunscriptionMetric, labelMaps[subscriptionIndex]["channel"], expectedLabelsNotFound)
-			}
-
-			if labelMaps[subscriptionIndex]["queue_name"] == queueName &&
-				labelMaps[subscriptionIndex]["durable_name"] == durableGroupSubscriptionName &&
-				labelMaps[subscriptionIndex]["is_durable"] == "true" {
-				foundQueuedDurableLabels = true
-			}
-
-			if labelMaps[subscriptionIndex]["durable_name"] == durableSubscriptionName &&
-				labelMaps[subscriptionIndex]["is_durable"] == "true" {
-				foundDurableLabels = true
-			}
-		}
-		if !foundQueuedDurableLabels {
-			t.Fatalf("Streaming subscription metric %v is missing expected label values "+
-				"for a queued durable subscription", streamingSunscriptionMetric)
-		}
-		if !foundDurableLabels {
-			t.Fatalf("Streaming subscription metric %v is missing expected label values "+
-				"for a durable subscription", streamingSunscriptionMetric)
-		}
+	expectedLabels4 := map[string]map[string]string{
+		"gnatsd_accountz_subscriptions": {
+			"account_id":   "$SYS",
+			"account_name": "$SYS",
+			"server_id":    "id",
+		},
 	}
+
+	verifyLabels(CoreSystem, url, "accountz", expectedLabels1, t)
+	verifyLabels(CoreSystem, url, "accountz", expectedLabels2, t)
+	verifyLabels(CoreSystem, url, "accountz", expectedLabels3, t)
+	verifyLabels(CoreSystem, url, "accountz", expectedLabels4, t)
 }
 
 func TestJetStreamMetrics(t *testing.T) {
 	clientPort := 4229
 	monitorPort := 8229
-	s := pet.RunJetStreamServerWithPorts(clientPort, monitorPort, "ABC")
-	defer s.Shutdown()
+	s, err := pet.RunJetStreamServerWithPorts(clientPort, monitorPort, "ABC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		os.RemoveAll(s.StoreDir())
+		s.Shutdown()
+	}()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/", monitorPort)
 	nc, err := nats.Connect(fmt.Sprintf("nats://localhost:%d", clientPort))
@@ -692,42 +571,259 @@ func TestJetStreamMetrics(t *testing.T) {
 		"jetstream_server_total_streams":   1,
 		"jetstream_server_total_consumers": 1,
 	}
-	verifyCollector(JetStreamSystem, url, "jsz", cases, t)
+	verifyJszCollector(url, "all", cases, t)
 }
 
-func TestReplicatorMetrics(t *testing.T) {
-	s1 := pet.RunServerWithPorts(pet.ClientPort, pet.MonitorPort)
-	defer s1.Shutdown()
-
-	s2 := pet.RunServerWithPorts(pet.ClientPort+1, pet.MonitorPort+1)
-	defer s2.Shutdown()
-
-	// Just test with NATS for this, getting protobuf errors with multiple
-	// streaming servers in the same process.
-	r, err := pet.RunTestReplicator(9922, pet.ClientPort, pet.ClientPort+1)
+func TestJetStreamMetricLabels(t *testing.T) {
+	clientPort := 4229
+	monitorPort := 8229
+	s, err := pet.RunJetStreamServerWithPorts(clientPort, monitorPort, "ABC")
 	if err != nil {
-		t.Fatalf("couldn't start replicator, %s", err)
+		t.Fatal(err)
 	}
-	defer r.Stop()
+	defer func() {
+		os.RemoveAll(s.StoreDir())
+		s.Shutdown()
+	}()
 
-	cases := map[string]float64{
-		"replicator_connector_bytes_in":       0,
-		"replicator_connector_bytes_out":      0,
-		"replicator_connector_connected":      1,
-		"replicator_connector_connects":       1,
-		"replicator_connector_disconnects":    0,
-		"replicator_connector_messages_in":    0,
-		"replicator_connector_messages_out":   0,
-		"replicator_connector_moving_average": 0,
-		"replicator_connector_quintile_50":    -1,
-		"replicator_connector_quintile_75":    -1,
-		"replicator_connector_quintile_90":    -1,
-		"replicator_connector_quintile_95":    -1,
-		"replicator_connector_request_count":  0,
+	url := fmt.Sprintf("http://127.0.0.1:%d/", monitorPort)
+	nc, err := nats.Connect(fmt.Sprintf("nats://localhost:%d", clientPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	url := "http://127.0.0.1:9922"
-	verifyCollector(ReplicatorSystem, url, "varz", cases, t)
+	streamName := "myStr"
+	existingStreamK := "streamFoo"
+	streamV := "bar"
+	missingStreamK := "missingStreamFoo"
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     streamName,
+		Metadata: map[string]string{existingStreamK: streamV},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumerName := "myCon"
+	existingConsumerK := "consFoo"
+	consumerV := "baz"
+	missingConsumerK := "missingConsFoo"
+	consumerConfig := nats.ConsumerConfig{Name: consumerName, Metadata: map[string]string{existingConsumerK: consumerV}}
+	_, err = js.AddConsumer(streamName, &consumerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// expected label keys
+	existingStreamLabelKey := "stream_meta_" + existingStreamK
+	missingStreamLabelKey := "stream_meta_" + missingStreamK
+	existingConsumerLabelKey := "consumer_meta_" + existingConsumerK
+	missingConsumerLabelKey := "consumer_meta_" + missingConsumerK
+
+	streamMetric := "jetstream_stream_total_bytes"
+	consumerMetric := "jetstream_consumer_num_ack_pending"
+	labelValues, err := getJszLabelValues(
+		url,
+		"all",
+		[]string{existingStreamK, missingStreamK},
+		[]string{existingConsumerK, missingConsumerK},
+		[]string{streamMetric, consumerMetric},
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error getting labels for %s metrics: %v", consumerMetric, err)
+	}
+
+	streamMaps, found := labelValues[streamMetric]
+	if !found || len(streamMaps) != 1 {
+		t.Fatalf("No info found for metric: %v", streamMetric)
+	}
+	streamLabels := streamMaps[0]
+	if val := streamLabels[existingStreamLabelKey]; val != streamV {
+		t.Fatalf("Unexpected value of stream label %s: \"%s\"", existingStreamLabelKey, val)
+	}
+	if _, ok := streamLabels[missingStreamLabelKey]; !ok {
+		t.Fatalf("Stream label %s for missing metadata value is missing", missingStreamLabelKey)
+	}
+	if val := streamLabels[missingStreamLabelKey]; val != "" {
+		t.Fatalf("Unexpected value of stream label %s: \"%s\"", missingStreamLabelKey, val)
+	}
+
+	consumerMaps, found := labelValues[consumerMetric]
+	if !found || len(consumerMaps) != 1 {
+		t.Fatalf("No info found for metric: %v", consumerMetric)
+	}
+	consumerLabels := consumerMaps[0]
+
+	if val := consumerLabels[existingStreamLabelKey]; val != streamV {
+		t.Fatalf("Value of consumer label %s has unexpected value \"%s\"", existingStreamLabelKey, val)
+	}
+	if _, ok := consumerLabels[missingStreamLabelKey]; !ok {
+		t.Fatalf("Consumer label %s for missing stream metadata value is missing", missingStreamLabelKey)
+	}
+	if val := consumerLabels[missingStreamLabelKey]; val != "" {
+		t.Fatalf("Unexpected value of consumer label %s: \"%s\"", missingStreamLabelKey, val)
+	}
+	if val := consumerLabels[existingConsumerLabelKey]; val != consumerV {
+		t.Fatalf("Value of consumer label %s has unexpected value \"%s\"", existingConsumerLabelKey, val)
+	}
+	if _, ok := consumerLabels[missingConsumerLabelKey]; !ok {
+		t.Fatalf("Consumer label %s for missing consumer metadata value is missing", missingConsumerLabelKey)
+	}
+	if val := consumerLabels[missingConsumerLabelKey]; val != "" {
+		t.Fatalf("Unexpected value of consumer label %s: \"%s\"", missingConsumerLabelKey, val)
+	}
+}
+
+func TestJetStreamSourceMetrics(t *testing.T) {
+	clientPort := 4230
+	monitorPort := 8230
+	s, err := pet.RunJetStreamServerWithPorts(clientPort, monitorPort, "ABC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		os.RemoveAll(s.StoreDir())
+		s.Shutdown()
+	}()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", monitorPort)
+	nc, err := nats.Connect(fmt.Sprintf("nats://localhost:%d", clientPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a source stream
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "source-stream",
+		Subjects: []string{"source.*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a stream with sources
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "target-stream",
+		Subjects: []string{"target.*"},
+		Sources: []*nats.StreamSource{
+			{
+				Name: "source-stream",
+				External: &nats.ExternalStream{
+					APIPrefix:     "$JS.EXT.API",
+					DeliverPrefix: "$JS.EXT.DELIVER",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish some messages to the source stream
+	js.Publish("source.test", []byte("message1"))
+	js.Publish("source.test", []byte("message2"))
+	time.Sleep(2 * time.Second)
+
+	// Test WITH external map
+	expectedLabels := map[string]map[string]string{
+		"jetstream_stream_source_lag": {
+			"source_name":    "source-stream",
+			"source_api":     "$JS.EXT.API",
+			"source_deliver": "$JS.EXT.DELIVER",
+			"stream_name":    "target-stream",
+		},
+		"jetstream_stream_source_active_duration_ns": {
+			"source_name":    "source-stream",
+			"source_api":     "$JS.EXT.API",
+			"source_deliver": "$JS.EXT.DELIVER",
+			"stream_name":    "target-stream",
+		},
+	}
+
+	verifyLabels(JetStreamSystem, url, "streams", expectedLabels, t)
+}
+
+func TestJetStreamSourceMetricsWithoutExternal(t *testing.T) {
+	clientPort := 4231
+	monitorPort := 8231
+	s, err := pet.RunJetStreamServerWithPorts(clientPort, monitorPort, "ABC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		os.RemoveAll(s.StoreDir())
+		s.Shutdown()
+	}()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", monitorPort)
+	nc, err := nats.Connect(fmt.Sprintf("nats://localhost:%d", clientPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a source stream
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "source-stream-no-ext",
+		Subjects: []string{"source.*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a stream with sources (no external config)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "target-stream-no-ext",
+		Subjects: []string{"target.*"},
+		Sources: []*nats.StreamSource{
+			{
+				Name: "source-stream-no-ext",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish some messages to the source stream
+	js.Publish("source.test", []byte("message1"))
+	js.Publish("source.test", []byte("message2"))
+	time.Sleep(2 * time.Second)
+
+	// Test WITHOUT external map (empty strings for source_api and source_deliver)
+	expectedLabels := map[string]map[string]string{
+		"jetstream_stream_source_lag": {
+			"source_name":    "source-stream-no-ext",
+			"source_api":     "",
+			"source_deliver": "",
+			"stream_name":    "target-stream-no-ext",
+		},
+		"jetstream_stream_source_active_duration_ns": {
+			"source_name":    "source-stream-no-ext",
+			"source_api":     "",
+			"source_deliver": "",
+			"stream_name":    "target-stream-no-ext",
+		},
+	}
+
+	verifyLabels(JetStreamSystem, url, "streams", expectedLabels, t)
 }
 
 func TestMapKeys(t *testing.T) {
