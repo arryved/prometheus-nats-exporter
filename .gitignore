@@ -30,4 +30,5 @@ travis_wait*.log
 build/
 dist/
 prometheus-nats-exporter
+prometheus-nats-exporter.docker
 coverage.txt
