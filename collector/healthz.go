@@ -90,8 +90,8 @@ func (nc *healthzCollector) Collect(ch chan<- prometheus.Metric) {
 
 		var health Healthz
 		if err := getMetricURL(nc.httpClient, server.URL, &health); err != nil {
-			Debugf("healthz collector ignoring server %s: %v", server.ID, err)
-			continue
+			Debugf("healthz collector error collecting server %s: %v", server.ID, err)
+			httpGetError = true
 		}
 
 		// keep the existing metric behaving the same
