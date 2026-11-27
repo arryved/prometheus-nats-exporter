@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,10 @@ type NATSCollector struct {
 	system         string
 	servers        []*CollectedServer
 	serverRespKeys map[string]struct{}
+	// metricNames maps a sanitized Prometheus metric name to the Stats key
+	// that owns it, so keys that only differ in illegal characters
+	// (e.g. "a.b" and "a-b") don't emit the same series twice.
+	metricNames map[string]string
 }
 
 // newPrometheusGaugeVec creates a custom GaugeVec
@@ -317,6 +322,7 @@ func (nc *NATSCollector) initMetricsFromServers(namespace string) {
 	var response map[string]interface{}
 
 	nc.Stats = make(map[string]metric)
+	nc.metricNames = make(map[string]string)
 
 	// gets URLs until one responds.
 	for _, v := range nc.servers {
@@ -396,7 +402,9 @@ func (nc *NATSCollector) objectToMetrics(response map[string]interface{}, namesp
 		}
 	}
 
-	for k := range response {
+	// Walk keys in sorted order so that, when two keys sanitize to the same
+	// metric name, the same one wins on every run.
+	for _, k := range slices.Sorted(maps.Keys(response)) {
 		fqn, path := fqName(k, prefix...)
 		if _, ok := skipFQN[fqn]; ok {
 			continue
@@ -421,12 +429,18 @@ func (nc *NATSCollector) objectToMetrics(response map[string]interface{}, namesp
 		i := response[k]
 		switch v := i.(type) {
 		case float64: // all json numbers are handled here.
+			if !nc.claimMetricName(fqn) {
+				break
+			}
 			nc.Stats[fqn] = metric{
 				path:   path,
 				metric: newPrometheusGaugeVec(nc.system, nc.endpoint, fqn, "", namespace),
 			}
 		case string:
 			if _, ok := labelKeys[k]; !ok {
+				break
+			}
+			if !nc.claimMetricName(fqn) {
 				break
 			}
 
@@ -453,6 +467,20 @@ func (nc *NATSCollector) objectToMetrics(response map[string]interface{}, namesp
 			Tracef("Unknown type:  %v %v, %v", fqn, k, v)
 		}
 	}
+}
+
+// claimMetricName records fqn as the owner of its sanitized metric name.
+// It returns false if a different key already owns that name: emitting both
+// would make the registry fail the whole scrape with "was collected before
+// with the same name and label values".
+func (nc *NATSCollector) claimMetricName(fqn string) bool {
+	name := convertIllegalMetricName(fqn)
+	if owner, ok := nc.metricNames[name]; ok {
+		Noticef("dropping %q: sanitized metric name %q is already used by %q", fqn, name, owner)
+		return false
+	}
+	nc.metricNames[name] = fqn
+	return true
 }
 
 // mapKeys returns a map of all keys in a map, including nested maps.
